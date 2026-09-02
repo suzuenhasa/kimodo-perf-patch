@@ -113,6 +113,26 @@ costs 5% over 100 steps; 25 costs 12%; the knee is at 15, which costs 38%.
 **R@3 cannot rank step counts at this sample size** — it is non-monotonic here, with 25
 scoring above 35. One clip is worth ~0.3 points across 327 cases.
 
+### 25 steps, confirmed on the full set — and rejected
+
+The table above suggested 25 steps was nearly free: +6% FID, R@3 indistinguishable. Rerunning
+25 steps on the same 1,311 cases as the headline result says otherwise.
+
+| Content / Overview | stock (100) | **35 (default)** | 25 |
+|---|---:|---:|---:|
+| ms/clip | 2344 | 938 | 632 |
+| R@3 ↑ | 88.65 | 87.77 | 86.68 |
+| FID ↓ | 0.032 | 0.039 | 0.045 |
+| Skate ↓ | 2.585 | 2.593 | 2.592 |
+
+FID moves **+15%**, not +6%, and R@3 drops a real **1.09 points** where 327 cases showed
+noise. That roughly doubles the total concession against stock — 0.88 → 1.97 points of R@3,
+FID +22% → +41% — to buy 1.48× speed. **The default stays at 35.**
+
+The lesson is about the measurement, not the model: a quarter-sized sample understated both
+metrics and would have argued for the change. `--steps 25` remains available for anyone who
+wants that trade explicitly.
+
 Two caveats. These FIDs are not comparable to the 0.039 above: FID is biased upward on
 fewer samples, and this used a quarter of the cases. Within this table the comparison is
 valid, because every row has the same sample size.
