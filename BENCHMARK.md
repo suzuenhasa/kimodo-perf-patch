@@ -133,6 +133,13 @@ The lesson is about the measurement, not the model: a quarter-sized sample under
 metrics and would have argued for the change. `--steps 25` remains available for anyone who
 wants that trade explicitly.
 
+**What the drop looks like.** Watching 87 prompts at both counts, 35 is consistently better
+and 25 is mostly fine but occasionally wrong — the failure is *upper-body posture*, arms
+hanging wide and shoulders hunched on clips where 35 is clean. That is consistent with where
+the metrics moved: FID is distance from real motion, and a hunched walk is off-manifold
+rather than an alternative valid walk. It is also consistent with what did *not* move —
+foot skate and contact are identical at both counts, and no one reports sliding feet.
+
 **Changing `--steps` re-rolls the motion, it does not refine it.** `space_timesteps` picks a
 stride of `(base_steps - 1) / (steps - 1)` through the base schedule, so 35 steps visits
 t ≈ 0, 29, 59, 88… and 25 visits t ≈ 0, 42, 83, 125… — grids sharing only their start. Same
