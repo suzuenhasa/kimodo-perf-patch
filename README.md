@@ -13,9 +13,16 @@ fast enough to keep resident. Measured on an RTX 3090 against `nv-tlabs/kimodo @
 Fits an 8 GB card. `--steps 100 --cfg-type separated` reproduces stock output — every
 speedup here is one you can back out of.
 
+Those figures are a warm 5 s clip at batch 16 and the resident footprint after load.
+[`BENCHMARK.md`](BENCHMARK.md) reports **938 ms and 6,882 MiB** for the same build, because
+NVIDIA's harness also runs post-processing and variable-length cases and measures peak
+rather than resident. Same stack, different question — neither number is the other one
+being wrong.
+
 Measured against **Kimodo's own benchmark**, that speedup costs about **one point of R@3**
-(87.77 vs 88.65) with foot-skate and foot-contact unchanged — see
-[`BENCHMARK.md`](BENCHMARK.md).
+(87.77 vs 88.65) with foot-skate and foot-contact unchanged. On *constrained* generation —
+pinned paths, hands, feet and full-body keyframes — it costs nothing at all: ours matches or
+beats stock on every constrained metric. See [`BENCHMARK.md`](BENCHMARK.md).
 
 ## Setup
 
