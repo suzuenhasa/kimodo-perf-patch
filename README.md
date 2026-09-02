@@ -172,13 +172,42 @@ clip = k.generate_sequence([("a person jumps", 3.0),
                             ("a person stands still", 5.0)])
 ```
 
-Segments are sequential by construction, so this cannot be batched — it is the opposite
-trade to `generate()`. Kimodo is trained to ~10 s, so split anything longer into
-consecutive segments.
+From the command line, segments are separated by `|`, each optionally `:<seconds>`
+(default 5). A colon inside a prompt is safe — only a trailing colon followed by a number
+reads as a duration:
+
+```bash
+kimodo-fast --timeline "a person walks forward:3 | a person stops and waves:3 | a person jumps:2"
+
+# several timelines: repeat the flag, or one per line in a file
+kimodo-fast --timeline "a person runs:4|a person stops:2" --timeline "a person crouches:3"
+kimodo-fast --timelines-file timelines.txt
+```
+
+This writes `timeline_00.npz…` plus a `timelines.json` recording each timeline's segments,
+durations and frame count.
+
+**What batches and what does not.** Segments within one timeline are sequential by
+construction — each is conditioned on the tail of the last. Kimodo's multi-prompt path
+also replicates one segment's text across the batch (`kimodo_model.py:164`), so the batch
+dimension carries *alternative takes of a single timeline*, not different timelines:
+
+```bash
+kimodo-fast --timeline "a person walks:3|a person jumps:2" --variations 4   # batched
+```
+
+`--variations 4` costs **1332 ms per take** against 1737 ms generating them one at a time,
+and the takes are genuinely sampled, not duplicated. Several *different* timelines run
+serially and cost **1.18×** the batched-clip path for the same segment count — measured, and
+the reason this wrapper does not patch Kimodo to batch them.
+
+Kimodo is trained to ~10 s, so split anything longer into consecutive segments.
 
 `transition_frames` defaults to **2**, not the demo's 5. At 5, later segments ignore their
 own prompt — "a person stands still" runs at 0.02 m/s alone and 0.88 m/s as a third segment
 after a walk, i.e. it just keeps walking. Raising text guidance makes it worse, not better.
+At 2, a walk → wave → jump timeline holds each segment to its own prompt (2.31 m/s, then
+0.18 m/s, then the largest vertical range) with no discontinuity at either splice.
 
 **Paths and IK** — constrain where the character goes, or pin a hand or foot:
 

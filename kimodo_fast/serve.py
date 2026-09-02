@@ -235,7 +235,7 @@ class KimodoFast:
                                  else torch.as_tensor(heading, dtype=torch.float32, device=dev)))
 
     # ---- motion ---------------------------------------------------------------------
-    def generate_sequence(self, segments, transition_frames=2, seed=0,
+    def generate_sequence(self, segments, transition_frames=2, seed=0, variations=1,
                           post_processing=True, constraints=None, first_heading=None,
                           steps=None, cache=True):
         # steps= overrides the instance default for one call: the point is progressive
@@ -298,19 +298,23 @@ class KimodoFast:
         # rather than defaulting to one sample.
         key = ("seq", tuple(prompts), tuple(frames), transition_frames, seed,
                steps or self.steps, post_processing, first_heading,
-               constraints is not None)
+               constraints is not None, variations)
         if cache and constraints is None and key in self._out_cache:
             return self._out_cache[key]
 
         out = self.model(prompts, frames, num_denoising_steps=steps or self.steps,
-                         num_samples=1,
+                         num_samples=variations,
                          multi_prompt=True, num_transition_frames=transition_frames,
                          constraint_lst=constraints or [],
                          post_processing=post_processing, return_numpy=True,
                          cfg_type=self.cfg_type, cfg_weight=self._cfgw(),
                          first_heading_angle=first_heading)
-        clip = {k: (v[0] if isinstance(v, np.ndarray) and v.ndim and v.shape[0] == 1 else v)
-                for k, v in out.items()}
+        def _slice(i):
+            return {k: (v[i] if isinstance(v, np.ndarray) and v.ndim and v.shape[0] == variations
+                        else v) for k, v in out.items()}
+        # variations>1 returns a list: these are alternative takes of the SAME timeline,
+        # which is the only thing Kimodo's batch dimension can carry here.
+        clip = _slice(0) if variations == 1 else [_slice(i) for i in range(variations)]
         if cache and constraints is None:
             # Small on purpose: these are megabytes each, and the hit that matters is a UI
             # replaying the same timeline, not a long history.
@@ -318,6 +322,20 @@ class KimodoFast:
                 self._out_cache.pop(next(iter(self._out_cache)))
             self._out_cache[key] = clip
         return clip
+
+    def generate_timelines(self, timelines, **kw):
+        """Several DIFFERENT timelines.
+
+        Sequential, and that is not an oversight. Kimodo's multi-prompt path does
+        `texts_bs = [text for _ in range(num_samples)]` (kimodo_model.py:164), i.e. it
+        replicates one segment's text across the batch, so the batch dimension carries
+        alternative takes of a single timeline -- not different timelines. Batching
+        distinct timelines would mean patching the model to accept per-sample prompts.
+
+        For alternative takes of ONE timeline, use generate_sequence(..., variations=N),
+        which is genuinely batched and close to free.
+        """
+        return [self.generate_sequence(t, **kw) for t in timelines]
 
     def _cfgw(self):
         """separated takes [text_cfg, constraint_cfg]; regular takes a scalar. cfg.py
@@ -363,6 +381,70 @@ class KimodoFast:
         return clips
 
 
+def parse_timeline(spec):
+    """'a person walks:3 | a person waves:2 | a person jumps' -> [(prompt, seconds), ...]
+
+    Segments are separated by '|'. A trailing ':<seconds>' sets that segment's duration;
+    without one it defaults to 5 s. Prompts may themselves contain a colon -- only a
+    trailing colon followed by a number is read as a duration.
+    """
+    segs = []
+    for part in spec.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        secs = 5.0
+        if ":" in part:
+            head, tail = part.rsplit(":", 1)
+            try:
+                secs = float(tail.strip())
+                part = head.strip()
+            except ValueError:
+                pass
+        if not part:
+            raise SystemExit(f"empty prompt in timeline segment: {spec!r}")
+        segs.append((part, secs))
+    if not segs:
+        raise SystemExit(f"no segments in timeline: {spec!r}")
+    return segs
+
+
+def _run_timelines(args, timelines):
+    k = KimodoFast(args.encoder, steps=args.steps, cfg_type=args.cfg_type)
+    total = sum(len(t) for t in timelines)
+    print(f"  {len(timelines)} timeline(s), {total} segment(s)"
+          + (f", {args.variations} variations" if args.variations > 1 else ""))
+    t0 = time.perf_counter()
+    if args.variations > 1:
+        # batched: alternative takes of one timeline
+        clips = k.generate_sequence(timelines[0], transition_frames=args.transition_frames,
+                                    seed=args.seed, variations=args.variations)
+        labels = [(timelines[0], i) for i in range(args.variations)]
+    else:
+        # sequential: the model cannot batch distinct timelines (see generate_timelines)
+        clips = k.generate_timelines(timelines,
+                                     transition_frames=args.transition_frames,
+                                     seed=args.seed)
+        labels = [(t, 0) for t in timelines]
+    dt = time.perf_counter() - t0
+    print(f"  {len(clips)} clip(s) in {dt:.3f} s  ({1000*dt/len(clips):.0f} ms each, "
+          f"{1000*dt/max(1,total):.0f} ms/segment)")
+
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    width = max(2, len(str(len(clips) - 1)))
+    meta = []
+    for i, (c, (segs, vi)) in enumerate(zip(clips, labels)):
+        f = outdir / f"timeline_{i:0{width}d}.npz"
+        np.savez_compressed(f, **{kk: v for kk, v in c.items() if isinstance(v, np.ndarray)})
+        desc = " | ".join(f"{p}:{d:g}" for p, d in segs)
+        frames = int(c["posed_joints"].shape[0]) if "posed_joints" in c else None
+        meta.append({"file": f.name, "segments": [[p, d] for p, d in segs],
+                     "variation": vi, "frames": frames})
+        print(f"    {f}  {frames} frames  {desc}")
+    (outdir / "timelines.json").write_text(json.dumps(meta, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prompts", nargs="*", help="prompts on the command line; omit if "
@@ -374,6 +456,19 @@ def main():
     ap.add_argument("--encoder", default="./enc_nf4",
                     help="path to an nf4 encoder (default), or 'bf16' for the original "
                          "15 GB one")
+    ap.add_argument("--timeline", action="append", default=[], metavar="SPEC",
+                    help="one continuous motion from segments separated by '|', each "
+                         "optionally ':<seconds>'. Repeat the flag for several timelines. "
+                         "e.g. --timeline \'a person walks:3|a person jumps:2\'")
+    ap.add_argument("--timelines-file", type=Path,
+                    help="one timeline per line, same syntax as --timeline. Blank lines "
+                         "and lines starting with # are skipped.")
+    ap.add_argument("--variations", type=int, default=1,
+                    help="alternative takes of a timeline, generated in one batch. Only "
+                         "valid with a single timeline.")
+    ap.add_argument("--transition-frames", type=int, default=2,
+                    help="frames blended between timeline segments (default 2; the demo's "
+                         "5 makes later segments ignore their own prompt)")
     ap.add_argument("--out", default="./out")
     ap.add_argument("--duration", type=float, default=5.0)
     ap.add_argument("--steps", type=int, default=35)
@@ -383,6 +478,25 @@ def main():
                     help="'separated' is stock Kimodo; 'regular' drops the third "
                          "guidance arm, which is zero without constraints")
     args = ap.parse_args()
+
+    timelines = [parse_timeline(t) for t in args.timeline]
+    if args.timelines_file:
+        if not args.timelines_file.is_file():
+            raise SystemExit(f"no such file: {args.timelines_file}")
+        for line in args.timelines_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                timelines.append(parse_timeline(line))
+
+    if timelines:
+        if args.prompts or args.prompts_file:
+            raise SystemExit("--timeline/--timelines-file and plain prompts are separate "
+                             "modes; run them separately")
+        if args.variations > 1 and len(timelines) > 1:
+            raise SystemExit("--variations applies to a single timeline; got "
+                             f"{len(timelines)}")
+        _run_timelines(args, timelines)
+        return
 
     prompts = list(args.prompts)
     if args.prompts_file:
