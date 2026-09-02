@@ -133,6 +133,14 @@ The lesson is about the measurement, not the model: a quarter-sized sample under
 metrics and would have argued for the change. `--steps 25` remains available for anyone who
 wants that trade explicitly.
 
+**Changing `--steps` re-rolls the motion, it does not refine it.** `space_timesteps` picks a
+stride of `(base_steps - 1) / (steps - 1)` through the base schedule, so 35 steps visits
+t ≈ 0, 29, 59, 88… and 25 visits t ≈ 0, 42, 83, 125… — grids sharing only their start. Same
+seed and same noise, different discretisation, different sample. Clips generated at two step
+counts are therefore different takes rather than a clean and a rough version of one, which
+is why they must be compared distributionally and not side by side. Practically: settle on a
+step count before generating anything you intend to keep.
+
 Two caveats. These FIDs are not comparable to the 0.039 above: FID is biased upward on
 fewer samples, and this used a quarter of the cases. Within this table the comparison is
 valid, because every row has the same sample size.

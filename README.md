@@ -152,7 +152,7 @@ return in 0.3 ms.
 | `--variations` | alternative takes of one timeline, batched |
 | `--transition-frames` | frames blended between segments, default 2 |
 | `--duration` | seconds, default 5. Kimodo is trained to ~10 |
-| `--steps` | denoising steps, default 35. `100` is stock |
+| `--steps` | denoising steps, default 35. `100` is stock. Changing it **re-rolls** motions rather than refining them — different step counts visit different timesteps, so the same seed gives a different take |
 | `--cfg-type` | `regular` (default) or `separated` (stock) |
 | `--batch` | prompts per denoiser pass, default 16 |
 | `--seed` | default 0 |
