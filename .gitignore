@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+
+# never commit credentials
+token
+*.token
+.env
+.envrc
+.netrc
+*.pem
+*.key
+id_rsa*
+
+# never commit weights -- kimodo-stream-encoder rebuilds enc_nf4/ in ~2 min
+enc_nf4/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# generated motion and local state
+*.npz
+*.bvh
+*.vrm
+*.log
+out/
+env.sh

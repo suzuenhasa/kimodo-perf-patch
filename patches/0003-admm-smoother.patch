@@ -1,0 +1,199 @@
+diff --git a/kimodo/motion_rep/smooth_root.py b/kimodo/motion_rep/smooth_root.py
+--- a/kimodo/motion_rep/smooth_root.py
++++ b/kimodo/motion_rep/smooth_root.py
+@@ -3,6 +3,7 @@
+ """Smooth root trajectory: ADMM-based smoother with margin constraints and get_smooth_root_pos helper."""
+ 
+ import math
++from functools import lru_cache
+ 
+ import numpy as np
+ import torch
+@@ -12,6 +13,61 @@
+ from kimodo.tools import ensure_batched
+ 
+ 
++@lru_cache(maxsize=32)
++def _factorized_system(n, pos_weight, loop):
++    """Build and LU-factorize the ADMM system matrix for an ``n``-frame trajectory.
++
++    ``M = pos_weight * I + A^T A + stepsize * I`` depends only on ``n``, ``pos_weight``
++    and ``loop`` -- it holds no trajectory data -- so the factorization is memoized and
++    reused by every smoother of the same shape, across multigrid levels and across calls.
++
++    Args:
++        n: Number of frames.
++        pos_weight: Weight for position preservation.
++        loop: Whether the trajectory should loop.
++
++    Returns:
++        Tuple of the ADMM step size and the ``splu`` factorization of ``M``.
++    """
++    # Build acceleration matrix A
++    a_data = []
++    a_rows = []
++    a_cols = []
++
++    for i in range(1, n - 1):
++        scale = 1.0
++        a_data.extend([-scale, 2.0 * scale, -scale])
++        a_rows.extend([i, i, i])
++        a_cols.extend([i - 1, i, i + 1])
++
++    if loop:
++        # Add periodic accelerations
++        scale = 1.0
++        a_data.extend([-scale, 2.0 * scale, -scale])
++        a_rows.extend([0, 0, 0])
++        a_cols.extend([n - 1, 0, 1])
++
++        scale = 1.0
++        a_data.extend([-scale, 2.0 * scale, -scale])
++        a_rows.extend([n - 1, n - 1, n - 1])
++        a_cols.extend([n - 2, n - 1, 0])
++
++    A = sparse.csr_matrix((a_data, (a_rows, a_cols)), shape=(n, n))
++
++    # Build identity matrix
++    identity_matrix = sparse.eye(n)
++
++    # Build system matrix M
++    M = pos_weight * identity_matrix + A.T @ A
++
++    # Calculate ADMM step size
++    diag_max = max(abs(M.diagonal()))
++    admm_stepsize = 0.25 * np.sqrt(diag_max)
++
++    M = M + admm_stepsize * identity_matrix
++    return admm_stepsize, splu(M.tocsc())
++
++
+ class TrajectorySmoother:
+     """Modify trajectories to hit target values while respecting soft constraints.
+ 
+@@ -48,43 +104,7 @@
+         # Store margin information as numpy arrays
+         self.margin_vals = margins
+ 
+-        # Build acceleration matrix A
+-        a_data = []
+-        a_rows = []
+-        a_cols = []
+-
+-        for i in range(1, N - 1):
+-            scale = 1.0
+-            a_data.extend([-scale, 2.0 * scale, -scale])
+-            a_rows.extend([i, i, i])
+-            a_cols.extend([i - 1, i, i + 1])
+-
+-        if loop:
+-            # Add periodic accelerations
+-            scale = 1.0
+-            a_data.extend([-scale, 2.0 * scale, -scale])
+-            a_rows.extend([0, 0, 0])
+-            a_cols.extend([N - 1, 0, 1])
+-
+-            scale = 1.0
+-            a_data.extend([-scale, 2.0 * scale, -scale])
+-            a_rows.extend([N - 1, N - 1, N - 1])
+-            a_cols.extend([N - 2, N - 1, 0])
+-
+-        A = sparse.csr_matrix((a_data, (a_rows, a_cols)), shape=(N, N))
+-
+-        # Build identity matrix
+-        identity_matrix = sparse.eye(N)
+-
+-        # Build system matrix M
+-        M = pos_weight * identity_matrix + A.T @ A
+-
+-        # Calculate ADMM step size
+-        diag_max = max(abs(M.diagonal()))
+-        self.admm_stepsize = 0.25 * np.sqrt(diag_max)
+-
+-        M = M + self.admm_stepsize * identity_matrix
+-        self.system_lu = splu(M.tocsc())
++        self.admm_stepsize, self.system_lu = _factorized_system(N, float(pos_weight), bool(loop))
+ 
+     def smooth(self, targets, x0):
+         """Interpolate between reference positions while satisfying constraints.
+@@ -102,10 +122,25 @@
+         z = np.zeros_like(x)
+         u = np.zeros_like(x)
+ 
+-        for _ in range(self.admm_iters):
+-            self.z_update(z, x, x_target, u)
+-            self.u_update(u, x, z)
+-            self.x_update(x, z, u, x_target)
++        # Scratch buffers, so that the iteration below allocates nothing. Each dtype is
++        # read off the expression that buffer replaces, evaluated on an empty slice, so
++        # that scalar promotion stays exactly what it was (``alpha * (x - z)`` and
++        # ``margins / norms`` both depend on it).
++        empty_norms = np.linalg.norm(x[:0], axis=1)
++        self._work = np.empty_like(x)
++        self._delta = np.empty_like(x, dtype=(self.alpha_overrelax * x[:0]).dtype)
++        self._norms = np.empty((len(x), 1), dtype=empty_norms.dtype)
++        self._scale = np.empty((len(x), 1), dtype=(np.asarray(self.margin_vals)[:0] / empty_norms).dtype)
++        self._norms_flat = self._norms[:, 0]
++        self._scale_flat = self._scale[:, 0]
++
++        # z_update divides by the row norms unconditionally, so a zero-length row must not
++        # raise under a caller's np.seterr (it produces a scale of exactly 1.0, see there).
++        with np.errstate(divide="ignore", invalid="ignore"):
++            for _ in range(self.admm_iters):
++                self.z_update(z, x, x_target, u)
++                self.u_update(u, x, z)
++                self.x_update(x, z, u, x_target)
+ 
+         return x
+ 
+@@ -119,24 +154,40 @@
+     def z_update(self, z, x, z_t, u):
+         """Update z in the ADMM iteration using vectorized operations."""
+         # Compute the difference from target for all margin locations at once
+-        z[:] = x + u - z_t
++        np.add(x, u, out=z)
++        np.subtract(z, z_t, out=z)
+ 
+-        # Check if we need to project back to margin
+-        z_diff_norms = np.linalg.norm(z, axis=1)
+-        mask = z_diff_norms > self.margin_vals
+-        if np.any(mask):
+-            scale_factors = self.margin_vals[mask] / z_diff_norms[mask]
+-            z[mask] *= scale_factors[:, np.newaxis]
++        # Row norms. This is exactly what np.linalg.norm(z, axis=1) computes for a real
++        # array: ``s = (z.conj() * z).real; sqrt(add.reduce(s, axis=1))``.
++        norms = self._norms_flat
++        np.multiply(z, z, out=self._work)
++        np.sum(self._work, axis=1, out=norms)
++        np.sqrt(norms, out=norms)
++
++        # Project the rows that lie outside their margin back onto it. A row inside its
++        # margin gets a scale of exactly 1.0, which is the same no-op that skipping it
++        # under the ``norms > margins`` mask was. fmin (not minimum) also sends the m/0
++        # and 0/0 quotients of a zero-length row to 1.0 -- those rows were never above
++        # their margin either, so the mask left them alone too.
++        np.divide(self.margin_vals, norms, out=self._scale_flat)
++        np.fmin(self._scale_flat, 1.0, out=self._scale_flat)
++        z *= self._scale
+ 
+         # Add back the target
+-        z[:] += z_t
++        z += z_t
+ 
+         if self.circle_project:
+-            z[:] = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1.0e-6)
++            np.multiply(z, z, out=self._work)
++            np.sum(self._work, axis=1, out=norms)
++            np.sqrt(norms, out=norms)
++            norms += 1.0e-6
++            z /= self._norms
+ 
+     def u_update(self, u, x, z):
+         """Update u in the ADMM iteration using vectorized operations."""
+-        u[:] += self.alpha_overrelax * (x - z)
++        np.subtract(x, z, out=self._work)
++        np.multiply(self.alpha_overrelax, self._work, out=self._delta)
++        u += self._delta
+ 
+ 
+ def smooth_signal(x, margins, pos_weight=0, alpha_overrelax=1.8, admm_iters=500, circle_project=False):

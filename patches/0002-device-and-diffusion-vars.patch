@@ -1,0 +1,212 @@
+diff --git a/kimodo/model/diffusion.py b/kimodo/model/diffusion.py
+index 7e36d99..272cf28 100644
+--- a/kimodo/model/diffusion.py
++++ b/kimodo/model/diffusion.py
+@@ -3,7 +3,7 @@
+ """Diffusion process and DDIM sampling for motion generation."""
+ 
+ import math
+-from typing import Optional, Tuple
++from typing import Any, Dict, Optional, Tuple
+ 
+ import torch
+ from torch import nn
+@@ -33,6 +33,15 @@ class Diffusion(torch.nn.Module):
+         """Set up cosine beta schedule and precompute diffusion variables for num_base_steps."""
+         super().__init__()
+         self.num_base_steps = num_base_steps
++        # Memo for the denoising schedule and the buffers derived from it. Both are a pure
++        # function of (num_denoising_steps, device) and the sampling loop asks for the same
++        # one on every step. Keyed rather than pinned, because the demo changes the step
++        # count between clicks without reloading the model: the "Denoising Steps" slider
++        # (kimodo/demo/ui.py:372) is read at click time and passed down to a model that
++        # comes straight out of the app.py:127-129 cache.
++        self._schedule_cache: Dict[Tuple[int, torch.device, bool], Tuple[torch.Tensor, torch.Tensor]] = {}
++        self._schedule_last: Optional[Tuple[Any, torch.device, Tuple[torch.Tensor, torch.Tensor]]] = None
++        self._diffusion_vars_key: Optional[torch.Tensor] = None
+         betas_base = get_beta_schedule(self.num_base_steps)
+         self.register_buffer("betas_base", betas_base, persistent=False)
+         alphas_cumprod_base = torch.cumprod(1.0 - self.betas_base, dim=0)
+@@ -47,9 +56,41 @@ class Diffusion(torch.nn.Module):
+     def device(self):
+         return self.betas_base.device
+ 
+-    def space_timesteps(self, num_denoising_steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
++    def space_timesteps(self, num_denoising_steps) -> Tuple[torch.Tensor, torch.Tensor]:
+         """Return (use_timesteps, map_tensor) for a subsampled denoising schedule of
+-        num_denoising_steps."""
++        num_denoising_steps.
++
++        Memoised per (step count, device); ``num_denoising_steps`` may be an int, a 0-d
++        tensor or a 1-element tensor. The caller is expected not to mutate a tensor it has
++        already passed in (nothing in this repo does: ``_generate`` builds a fresh one per
++        generation).
++        """
++        # Identity check first, before the key is built: num_denoising_steps is normally a
++        # CUDA tensor, and reading it back to the host to build the key is itself a stream
++        # sync (cudaMemcpyAsync + cudaStreamSynchronize), which is part of what this memo
++        # exists to remove.
++        device = self.device
++        last = self._schedule_last
++        if last is not None and last[0] is num_denoising_steps and last[1] == device:
++            return last[2]
++
++        is_tensor = isinstance(num_denoising_steps, torch.Tensor)
++        # One host read per distinct schedule instead of one per denoising step.
++        steps = int(num_denoising_steps.reshape(-1)[0]) if is_tensor else int(num_denoising_steps)
++        # is_tensor is part of the key so an int request and a tensor request never share an
++        # entry: they build frac_stride at different precisions.
++        key = (steps, device, is_tensor)
++        entry = self._schedule_cache.get(key)
++        if entry is None:
++            entry = self._build_timestep_schedule(num_denoising_steps)
++            self._schedule_cache[key] = entry
++        self._schedule_last = (num_denoising_steps, device, entry)
++        return entry
++
++    def _build_timestep_schedule(self, num_denoising_steps) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Uncached body of ``space_timesteps``; arithmetic unchanged."""
++        if isinstance(num_denoising_steps, torch.Tensor) and num_denoising_steps.dim() > 0:
++            num_denoising_steps = num_denoising_steps[0]
+         nsteps_train = self.num_base_steps
+         frac_stride = (nsteps_train - 1) / max(1, num_denoising_steps - 1)
+         use_timesteps = torch.round(torch.arange(nsteps_train, device=self.device) * frac_stride).to(torch.long)
+@@ -59,7 +100,18 @@ class Diffusion(torch.nn.Module):
+ 
+     def calc_diffusion_vars(self, use_timesteps: torch.Tensor) -> None:
+         """Update buffers (betas, alphas, alphas_cumprod, etc.) for the given subsampled
+-        timesteps."""
++        timesteps.
++
++        Skipped when the buffers already hold the result for this exact tensor. They are a
++        pure function of ``use_timesteps`` and ``alphas_cumprod_base``, and the sampling loop
++        hands back the memoised schedule tensor on every step. That also keeps the two
++        ``torch.tensor([1.0]).to(...)`` copies below out of the inner loop: pageable
++        host-to-device copies are blocking, i.e. a full stream sync each.
++        """
++        if use_timesteps is self._diffusion_vars_key:
++            return
++        self._diffusion_vars_key = None
++
+         alphas_cumprod = self.alphas_cumprod_base[use_timesteps]
+         last_alpha_cumprod = torch.cat([torch.tensor([1.0]).to(alphas_cumprod), alphas_cumprod[:-1]])
+         betas = 1.0 - alphas_cumprod / last_alpha_cumprod
+@@ -93,6 +145,8 @@ class Diffusion(torch.nn.Module):
+             persistent=False,
+         )
+ 
++        self._diffusion_vars_key = use_timesteps
++
+     def q_sample(
+         self,
+         x_start: torch.Tensor,
+diff --git a/kimodo/model/kimodo_model.py b/kimodo/model/kimodo_model.py
+index 7f4f2c3..d7cff56 100644
+--- a/kimodo/model/kimodo_model.py
++++ b/kimodo/model/kimodo_model.py
+@@ -57,6 +57,13 @@ class Kimodo(nn.Module):
+ 
+         self.to(device)
+ 
++        # MotionRepBase is a plain object, not an nn.Module, so it is held as a plain
++        # attribute on the denoiser and the .to() above never reaches the mean/std buffers
++        # its Stats own. Move them once here instead of paying a blocking host-to-device
++        # copy of each inside every normalize/unnormalize call.
++        if device is not None:
++            self.motion_rep.to(device)
++
+     @property
+     def output_skeleton(self):
+         """Skeleton used for model output (somaskel77 for SOMA, else unchanged)."""
+@@ -92,10 +99,12 @@ class Kimodo(nn.Module):
+         Returns:
+             torch.Tensor: [B, T, D] noisy motion input to t-1
+         """
+-        # subsample timesteps
+-        #   NOTE: do this at every step due to ONNX export, i.e. num_samp_stepsmay change dynamically when
+-        #       running onnx version so need to account for that.
+-        num_denoising_steps = num_denoising_steps[0]
++        # Subsample timesteps. The schedule is constant for a whole generation, so both
++        #   calls below are memoised inside Diffusion on (step count, device) and are a
++        #   dict hit after the first step; _generate primes them before the loop. They stay
++        #   here so denoising_step remains callable on its own. The tensor is passed
++        #   through whole rather than indexed, so the memo can match it by identity
++        #   without reading a CUDA scalar back to the host.
+         use_timesteps, map_tensor = self.diffusion.space_timesteps(num_denoising_steps)
+         self.diffusion.calc_diffusion_vars(use_timesteps)
+ 
+@@ -612,7 +621,9 @@ class Kimodo(nn.Module):
+             [num_denoising_steps], device=self.device
+         )  # this and t need to be tensor for onnx export
+         # init diffusion with correct num steps before looping
+-        use_timesteps = self.diffusion.space_timesteps(num_denoising_steps[0])[0]
++        #   passing the same tensor object the loop passes lets the memo in
++        #   Diffusion.space_timesteps match on identity from the first step onwards
++        use_timesteps = self.diffusion.space_timesteps(num_denoising_steps)[0]
+         self.diffusion.calc_diffusion_vars(use_timesteps)
+         for i in progress_bar(indices):
+             t = torch.tensor([i] * cur_mot.size(0), device=self.device)
+diff --git a/kimodo/motion_rep/feature_utils.py b/kimodo/motion_rep/feature_utils.py
+index fd20436..363b154 100644
+--- a/kimodo/motion_rep/feature_utils.py
++++ b/kimodo/motion_rep/feature_utils.py
+@@ -57,8 +57,11 @@ def compute_vel_xyz(
+         assert positions.shape[0] == 1, "If lengths is not provided, the input should not be batched."
+         lengths = torch.tensor([len(positions)], device=device)
+ 
+-    # useful for indexing
+-    range_len = torch.arange(len(lengths))
++    # useful for indexing; built on `device` so that the mixed-device advanced indexing
++    # below does not silently copy it host-to-device on every call. A CPU index against a
++    # CUDA tensor goes through ATen/native/IndexingUtils.h `expandTensors`, which does a
++    # plain `index.to(self.device())` -- a blocking pageable copy, i.e. a stream sync.
++    range_len = torch.arange(len(lengths), device=device)
+ 
+     # compute velocities with fps
+     velocity = fps * (positions[:, 1:] - positions[:, :-1])
+@@ -93,8 +96,11 @@ def compute_vel_angle(
+         assert root_rot_angles.shape[0] == 1, "If lengths is not provided, the input should not be batched."
+         lengths = torch.tensor([len(root_rot_angles)], device=device)
+ 
+-    # useful for indexing
+-    range_len = torch.arange(len(lengths))
++    # useful for indexing; built on `device` so that the mixed-device advanced indexing
++    # below does not silently copy it host-to-device on every call. A CPU index against a
++    # CUDA tensor goes through ATen/native/IndexingUtils.h `expandTensors`, which does a
++    # plain `index.to(self.device())` -- a blocking pageable copy, i.e. a stream sync.
++    range_len = torch.arange(len(lengths), device=device)
+ 
+     local_root_rot_vel = diff_angles(root_rot_angles, fps)
+     pad_rot_vel_angles = torch.zeros_like(root_rot_angles[:, 0])
+diff --git a/kimodo/motion_rep/reps/base.py b/kimodo/motion_rep/reps/base.py
+index 6911cea..7b94e5f 100644
+--- a/kimodo/motion_rep/reps/base.py
++++ b/kimodo/motion_rep/reps/base.py
+@@ -82,6 +82,28 @@ class MotionRepBase:
+             self.stats = Stats()
+             self.stats.register_from_tensors(mean, std)
+ 
++    #: every Stats instance this class owns; ``to`` has to reach all of them
++    _STATS_ATTRS = ("stats", "global_root_stats", "local_root_stats", "body_stats")
++
++    def to(self, device):
++        """Move the normalization statistics to ``device`` in place and return ``self``.
++
++        ``MotionRepBase`` is a plain object, not an ``nn.Module``, so it is stored as a plain
++        attribute on the denoiser and ``nn.Module.to()`` never reaches the mean/std buffers
++        owned by its ``Stats``. Left alone they stay on the CPU for the life of the process
++        and ``Stats.normalize``/``unnormalize`` copy both across on every call. The per-call
++        ``.to()`` in ``Stats`` stays as the device guard for CPU callers; once the buffers are
++        already on the right device it aliases instead of copying.
++
++        The attributes only exist when the representation was built with a ``stats_path``
++        (``benchmark/create_benchmark.py:82`` builds one without), hence the getattr.
++        """
++        for name in self._STATS_ATTRS:
++            stats = getattr(self, name, None)
++            if stats is not None:
++                stats.to(device)
++        return self
++
+     def get_root_pos(self, features: torch.Tensor, fallback_to_smooth: bool = True):
+         """Extract root positions from a feature tensor.

@@ -1,0 +1,62 @@
+diff --git a/kimodo/model/llm2vec/models/bidirectional_llama.py b/kimodo/model/llm2vec/models/bidirectional_llama.py
+index f3e624e..96d476b 100644
+--- a/kimodo/model/llm2vec/models/bidirectional_llama.py
++++ b/kimodo/model/llm2vec/models/bidirectional_llama.py
+@@ -53,6 +53,15 @@ from transformers.utils import logging
+ 
+ from .utils import is_transformers_attn_greater_or_equal_4_43_1
+ 
++# transformers >= 5 only. On older versions LlamaModel still calls _update_causal_mask, the
++# override below still runs, and forward() must stay out of the way.
++try:
++    from transformers.masking_utils import (
++        create_bidirectional_mask as _CREATE_BIDIRECTIONAL_MASK,
++    )
++except ImportError:
++    _CREATE_BIDIRECTIONAL_MASK = None
++
+ logger = logging.get_logger(__name__)
+ 
+ 
+@@ -119,6 +128,41 @@ class LlamaBiModel(LlamaModel):
+         # Initialize weights and apply final processing
+         self.post_init()
+ 
++    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
++        """Keep this encoder bidirectional when the batch contains padding.
++
++        transformers >= 5 removed LlamaModel._update_causal_mask and calls the module-level
++        create_causal_mask() instead, so the override below is dead code and never runs. The
++        only surviving bidirectional mechanism is ModifiedLlamaAttention.is_causal = False,
++        which SDPA honours ONLY when create_causal_mask() returns None. That skip is
++        disallowed as soon as the mask contains a zero -- so the moment ANY prompt in the
++        batch is padded, this encoder silently becomes CAUSAL.
++
++        Measured before this fix: changing the last token moved the first token's hidden
++        state by 2.18 unpadded, and by exactly 0.0 padded. Bidirectionality, which is the
++        entire point of LLM2Vec, was lost -- and an unpadded row batched alongside a shorter
++        prompt shifted by 2630% of mean |h|. That is why the wrapper pins batch_size=1.
++
++        Building the mask here and passing it down as a 4-D tensor sidesteps it:
++        create_causal_mask returns a 4-D attention_mask untouched.
++        """
++        if _CREATE_BIDIRECTIONAL_MASK is not None:
++            if inputs_embeds is None and input_ids is not None:
++                inputs_embeds = self.embed_tokens(input_ids)
++                input_ids = None
++            if attention_mask is not None and attention_mask.dim() == 2:
++                attention_mask = _CREATE_BIDIRECTIONAL_MASK(
++                    config=self.config,
++                    input_embeds=inputs_embeds,
++                    attention_mask=attention_mask,
++                )
++        return super().forward(
++            input_ids=input_ids,
++            attention_mask=attention_mask,
++            inputs_embeds=inputs_embeds,
++            **kwargs,
++        )
++
+     def _update_causal_mask(
+         self,
+         attention_mask,

@@ -1,0 +1,50 @@
+diff --git a/kimodo/metrics/tmr.py b/kimodo/metrics/tmr.py
+index aa0c1ac..df4c971 100644
+--- a/kimodo/metrics/tmr.py
++++ b/kimodo/metrics/tmr.py
+@@ -490,6 +490,17 @@ def calculate_activation_statistics(activations):
+     return mu, cov
+ 
+ 
++def _sqrtm(a):
++    """scipy.linalg.sqrtm across versions.
++
++    Before scipy 1.16 it accepted disp=False and returned (result, errest); newer versions
++    dropped both and return the matrix alone. Kimodo pins no scipy, so calling it the old
++    way raises TypeError and every FID metric fails.
++    """
++    r = linalg.sqrtm(a)
++    return r[0] if isinstance(r, tuple) else r
++
++
+ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+     """Numpy implementation of the Frechet Distance. The Frechet distance between two multivariate
+     Gaussians X_1 ~ N(mu_1, C_1)
+@@ -521,20 +532,23 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+ 
+     diff = mu1 - mu2
+ 
+-    # Product might be almost singular
+-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
++    # Product might be almost singular.
++    # scipy removed sqrtm's `disp` argument, and with it the (result, errest) tuple return
++    # -- so `covmean, _ = sqrtm(..., disp=False)` raises TypeError on scipy >= 1.16 and the
++    # whole FID computation dies. Accept either shape rather than pinning scipy.
++    covmean = _sqrtm(sigma1.dot(sigma2))
+     if not np.isfinite(covmean).all():
+         msg = ("fid calculation produces singular product; " "adding %s to diagonal of cov estimates") % eps
+         print(msg)
+         offset = np.eye(sigma1.shape[0]) * eps
+-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
++        covmean = _sqrtm((sigma1 + offset).dot(sigma2 + offset))
+ 
+     # Numerical error might give slight imaginary component
+     if np.iscomplexobj(covmean):
+         if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+             # try again with diagonal %s
+             offset = np.eye(sigma1.shape[0]) * eps
+-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
++            covmean = _sqrtm((sigma1 + offset).dot(sigma2 + offset))
+             if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+                 m = np.max(np.abs(covmean.imag))
+                 raise ValueError("Imaginary component {}".format(m))

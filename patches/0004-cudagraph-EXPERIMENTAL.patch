@@ -1,0 +1,148 @@
+diff --git a/kimodo/model/backbone.py b/kimodo/model/backbone.py
+index 014f659..2cda5e0 100644
+--- a/kimodo/model/backbone.py
++++ b/kimodo/model/backbone.py
+@@ -3,6 +3,7 @@
+ """Transformer backbone: padding, masking, and encoder stack for the denoiser."""
+ 
+ import logging
++import os
+ from typing import Optional, Union
+ 
+ import torch
+@@ -57,6 +58,104 @@ def pad_x_and_mask_to_fixed_size(x: Tensor, mask: Tensor, size: int):
+     return new_x, new_mask
+ 
+ 
++# Kill switch for the captured-encoder path below (KIMODO_CUDA_GRAPH=0 -> always eager).
++_GRAPH_ENV = "KIMODO_CUDA_GRAPH"
++# Only capture a shape that has proved it is a sampling loop rather than a one-off
++# call: DDIM sampling reuses one shape for every step, nothing else does.
++_GRAPH_MIN_CALLS = 8
++# Each captured graph pins a private memory pool (~50 MB at the shipped shape).
++_GRAPH_MAX_SHAPES = 2
++
++
++class _EncoderGraphCache:
++    """Replay the transformer encoder stack from a captured CUDA graph.
++
++    Within one generation the stack is a pure function of ``(xseq, mask)``:
++    the module is in eval mode, dropout is 0, ``use_nested_tensor`` is False so
++    nothing inspects the mask on the host, and the weights never move.  All the
++    denoising steps therefore re-issue exactly the same kernels with only the
++    input buffer changing, which is what CUDA graphs are for.  Replay runs the
++    identical kernels in the identical order on the identical values, so the
++    output is bit-identical to the eager path.
++
++    Everything here is best effort.  A caller that is not the inference-mode
++    sampling loop, an unseen shape, or any failure during capture falls back to
++    running the encoder eagerly.
++    """
++
++    __slots__ = ("_graphs", "_calls", "_enabled")
++
++    def __init__(self):
++        self._graphs = {}
++        self._calls = {}
++        self._enabled = os.environ.get(_GRAPH_ENV, "1").strip().lower() not in ("0", "false", "no")
++
++    def clear(self) -> None:
++        """Drop every captured graph (their pools reference stale weights)."""
++        self._graphs.clear()
++        self._calls.clear()
++
++    def __call__(self, encoder: nn.Module, xseq: Tensor, mask: Tensor) -> Tensor:
++        if (
++            not self._enabled
++            or encoder.training
++            or not xseq.is_cuda
++            or torch.is_grad_enabled()
++            or not torch.is_inference_mode_enabled()
++            or torch.cuda.is_current_stream_capturing()
++        ):
++            return encoder(xseq, src_key_padding_mask=mask)
++
++        key = (xseq.device, tuple(xseq.shape), xseq.dtype, tuple(mask.shape), mask.dtype)
++        entry = self._graphs.get(key)
++        if entry is None:
++            if len(self._graphs) >= _GRAPH_MAX_SHAPES:
++                # A workload whose shape keeps changing (an eval sweep, a demo
++                # slider) stops capturing and behaves exactly as it does today.
++                return encoder(xseq, src_key_padding_mask=mask)
++            calls = self._calls.get(key, 0) + 1
++            self._calls[key] = calls
++            if calls < _GRAPH_MIN_CALLS:
++                return encoder(xseq, src_key_padding_mask=mask)
++            entry = self._capture(encoder, xseq, mask)
++            if entry is None:
++                return encoder(xseq, src_key_padding_mask=mask)
++            self._graphs[key] = entry
++
++        graph, static_xseq, static_mask, static_out = entry
++        static_xseq.copy_(xseq)
++        static_mask.copy_(mask)
++        graph.replay()
++        return static_out.clone()
++
++    def _capture(self, encoder: nn.Module, xseq: Tensor, mask: Tensor):
++        static_xseq = xseq.clone()
++        static_mask = mask.clone()
++        try:
++            # Warm up on a side stream first (lazy cuBLAS/allocator init cannot
++            # happen inside a capture), then capture one forward.
++            side_stream = torch.cuda.Stream()
++            side_stream.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(side_stream):
++                for _ in range(3):
++                    encoder(static_xseq, src_key_padding_mask=static_mask)
++            torch.cuda.current_stream().wait_stream(side_stream)
++
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                static_out = encoder(static_xseq, src_key_padding_mask=static_mask)
++        except Exception:
++            log.warning(
++                "CUDA graph capture of the transformer encoder failed, "
++                "falling back to eager execution.",
++                exc_info=True,
++            )
++            self._enabled = False
++            torch.cuda.synchronize()
++            return None
++        return graph, static_xseq, static_mask, static_out
++
++
+ @dataclass(frozen=True, config=dict(extra="forbid", arbitrary_types_allowed=True))
+ class TransformerEncoderBlockConfig:
+     """Configuration for the transformer encoder backbone."""
+@@ -133,6 +232,17 @@ class TransformerEncoderBlock(nn.Module):
+             enable_nested_tensor=False,
+         )
+ 
++        # Not an nn.Module: it must stay out of state_dict() and out of .to().
++        self._encoder_graphs = _EncoderGraphCache()
++
++    def _apply(self, *args, **kwargs):
++        # .to() / .cuda() / .float() reallocate the encoder weights; a captured
++        # graph still points at the old addresses, so throw the graphs away.
++        cache = getattr(self, "_encoder_graphs", None)
++        if cache is not None:
++            cache.clear()
++        return super()._apply(*args, **kwargs)
++
+     def forward(
+         self,
+         x: Tensor,
+@@ -223,9 +333,10 @@ class TransformerEncoderBlock(nn.Module):
+         if isinstance(self.seqTransEncoder, nn.TransformerEncoder):
+             assert not self.seqTransEncoder.use_nested_tensor, "Flash attention should be disabled due to bug!"
+ 
+-        output = self.seqTransEncoder(
++        output = self._encoder_graphs(
++            self.seqTransEncoder,
+             xseq,
+-            src_key_padding_mask=src_key_padding_mask,
++            src_key_padding_mask,
+         )
+         output = output[:, pose_start_ind:]  # [B, T, D]
+         output = self.output_linear(output)  # [B, T, OD]

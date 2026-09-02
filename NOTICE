@@ -1,0 +1,23 @@
+kimodo-perf
+Copyright 2026 the kimodo-perf contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This project is an independent set of performance patches, measurement scripts and
+tooling for Kimodo (https://github.com/nv-tlabs/kimodo). It is not affiliated with,
+endorsed by, or supported by NVIDIA.
+
+The files under patches/ are diffs against Kimodo, which is:
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+
+patches/0005 is the exception: it modifies Kimodo's vendored copy of LLM2Vec
+(kimodo/model/llm2vec/), which originates from McGill-NLP/llm2vec and is MIT licensed.
+
+Kimodo's own weights and the text-encoder weights it depends on carry their own,
+separate licences, which this repository neither includes nor relicenses:
+  * NVIDIA Open Model License, for the Kimodo-SOMA-RP-v1.1 model weights
+  * Meta Llama 3 Community License, for the Llama-3-8B base weights
+  * the terms attached to the McGill-NLP LLM2Vec adapters
+Anyone redistributing a built encoder checkpoint must satisfy those terms themselves;
+see "Build the encoder" in README.md.

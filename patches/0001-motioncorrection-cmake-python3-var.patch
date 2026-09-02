@@ -1,0 +1,17 @@
+diff --git a/setup.py b/setup.py
+index 35d8688..5316206 100644
+--- a/setup.py
++++ b/setup.py
+@@ -32,6 +32,12 @@ class CMakeBuild(build_ext):
+         cmake_args = [
+             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
+             f"-DPYTHON_EXECUTABLE={sys.executable}",
++            # CMakeLists.txt uses find_package(Python3 ...), whose cache variable is
++            # Python3_EXECUTABLE. The legacy PYTHON_EXECUTABLE above is read only by the
++            # deprecated FindPythonInterp module and is ignored by FindPython3, so on any
++            # CMake >= 3.12 building inside a venv this fails with
++            #   Could NOT find Python3 (missing: Python3_EXECUTABLE Interpreter)
++            f"-DPython3_EXECUTABLE={sys.executable}",
+         ]
+ 
+         cfg = "Debug" if self.debug else "Release"

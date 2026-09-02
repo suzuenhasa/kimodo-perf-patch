@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kimodo-fast"
+version = "0.1.0"
+description = "A resident, 4-bit, batched runtime for NVIDIA's Kimodo motion diffusion model"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "torch>=2.4",
+  "numpy>=1.24",
+  "transformers>=4.44",
+  "accelerate>=0.30",
+  "peft>=0.11",
+  "bitsandbytes>=0.43",   # 4-bit serialisation; older releases cannot save a quantized model
+]
+
+[project.optional-dependencies]
+bvh = ["bvhio"]           # BVH export, for Blender / Maya / MotionBuilder
+hub = ["huggingface_hub"] # kimodo-publish-encoder
+
+[project.scripts]
+kimodo-fast = "kimodo_fast.serve:main"
+kimodo-build-encoder = "kimodo_fast.build_encoder:main"
+kimodo-publish-encoder = "kimodo_fast.publish_encoder:main"
+kimodo-stream-encoder = "kimodo_fast.stream_build:main"
+
+[tool.setuptools]
+packages = ["kimodo_fast"]
