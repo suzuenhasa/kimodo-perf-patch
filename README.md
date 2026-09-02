@@ -205,8 +205,12 @@ kimodo-fast --timeline "a person walks:3|a person jumps:2" --variations 4   # ba
 
 `--variations 4` costs **1332 ms per take** against 1737 ms generating them one at a time,
 and the takes are genuinely sampled, not duplicated. Several *different* timelines run
-serially and cost **1.18×** the batched-clip path for the same segment count — measured, and
-the reason this wrapper does not patch Kimodo to batch them.
+serially at **628 ms per segment** — about **1.6×** the batched-clip path for the same
+segment count. That gap is real but small enough that patching Kimodo to accept per-sample
+prompts is not worth it.
+
+In practice a 9-second timeline of three segments takes **1.88 s**, so generation runs about
+4.8× faster than real time.
 
 Kimodo is trained to ~10 s, so split anything longer into consecutive segments.
 
