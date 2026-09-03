@@ -291,6 +291,23 @@ def main():
             if s.is_file():
                 (out / f).write_bytes(s.read_bytes())
         cfg = json.loads((w_dir / "config.json").read_text())
+        # llm2vec adds the Llama-3 chat header only when config._name_or_path is exactly
+        # "meta-llama/Meta-Llama-3-8B-Instruct" (llm2vec.py, prepare_for_tokenization), and
+        # transformers overwrites that field with the load path anyway -- which is why
+        # serve.py restores it explicitly. This only matters for a third-party loader that
+        # trusts config.json (llm2vec's own from_pretrained does). w_dir is the ungated
+        # MIRROR and carries no _name_or_path, so take it from the adapter repo.
+        a_cfg = a_dir / "config.json"
+        canonical = "meta-llama/Meta-Llama-3-8B-Instruct"
+        if a_cfg.is_file():
+            cfg["_name_or_path"] = json.loads(a_cfg.read_text()).get("_name_or_path") or canonical
+        else:
+            cfg["_name_or_path"] = canonical
+        if cfg["_name_or_path"] != canonical:
+            print(f"  note: _name_or_path is {cfg['_name_or_path']!r}, not {canonical!r}. "
+                  f"llm2vec adds the Llama-3 chat header only on an exact match, so a loader "
+                  f"that trusts this file will tokenize differently. serve.py sets it "
+                  f"explicitly and is unaffected.")
         cfg["architectures"] = ["LlamaBiModel"]
         cfg["dtype"] = cfg["torch_dtype"] = "bfloat16"
         cfg["quantization_config"] = {
